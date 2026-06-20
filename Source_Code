@@ -1,0 +1,322 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoOTA.h>
+#include <DHT.h>
+#include <ESP32Servo.h>
+#include <Wire.h>
+#include <Adafruit_SGP30.h>
+
+// wifi
+const char* ssid = "____";
+const char* password = "_____";
+WiFiServer server(80);
+
+// thingspeak
+String apiKey = "_______";
+String channelURL = "_______";
+unsigned long lastTS = 0;
+bool thingSpeakOK = false;
+
+// define pins
+#define DHT_PIN       4        
+#define LED_PIN       5
+#define AIRCOND_PIN   26
+#define BUZZER_PIN    27
+#define SERVO_PIN     25
+
+DHT dht(DHT_PIN, DHT11);   
+Servo doorServo;
+Adafruit_SGP30 sgp;
+
+float temp = NAN;
+float hum  = NAN;
+uint16_t tvoc = 0;
+uint16_t eco2 = 0;
+
+unsigned long lastDHTRead = 0;
+unsigned long lastSGPRead = 0;
+
+// define states
+int lightState  = 0;
+int aircondState = 0;
+int doorState   = 0;
+
+// temp and humid threshold
+float TEMP_LIMIT = 30.0;
+float HUM_LIMIT  = 70.0;
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(AIRCOND_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  digitalWrite(LED_PIN, LOW);
+  digitalWrite(AIRCOND_PIN, LOW);
+
+  dht.begin();
+
+  doorServo.attach(SERVO_PIN);
+  doorServo.write(0);
+
+  Wire.begin(21, 22);
+  delay(1000);
+
+// check if sgp30 functioning or not
+  if (!sgp.begin()) {
+    Serial.println("SGP30 NOT detected");
+  } else {
+    Serial.println("SGP30 detected");
+  }
+
+// connecting to wifi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+//web server ip address
+  Serial.println("\nWiFi Connected");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  server.begin();
+
+  ArduinoOTA.setHostname("ESP32-SmartHome");
+  ArduinoOTA.begin();
+
+  Serial.println("System Ready");
+}
+
+void loop() {
+  ArduinoOTA.handle();
+  readDHT();
+  readSGP();
+  handleWeb();
+  climateAlert();
+  thingSpeakUpdate();
+}
+
+//  dht 11 sensor
+void readDHT() {
+  if (millis() - lastDHTRead < 2000) return;
+
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+
+  if (!isnan(t) && !isnan(h)) {
+    temp = t;
+    hum = h;
+  }
+
+  lastDHTRead = millis();
+}
+
+// check air quality
+void readSGP() {
+  if (millis() - lastSGPRead < 1000) return;
+
+  if (sgp.IAQmeasure()) {
+    tvoc = sgp.TVOC;
+    eco2 = sgp.eCO2;
+  }
+
+  lastSGPRead = millis();
+}
+
+// sgp30 alert
+void climateAlert() {
+  bool alert = false;
+
+  if (!isnan(temp) && temp > TEMP_LIMIT) alert = true;
+  if (!isnan(hum) && hum > HUM_LIMIT) alert = true;
+  if (eco2 > 1000) alert = true;
+
+  digitalWrite(BUZZER_PIN, alert);
+}
+
+// web server
+void handleWeb() {
+  WiFiClient client = server.available();
+  if (!client) return;
+
+  String header = "";
+
+  while (client.connected()) {
+    if (client.available()) {
+      char c = client.read();
+      header += c;
+
+      if (c == '\n') {
+
+        // button handling
+        if (header.indexOf("GET /light/on") >= 0) {
+          digitalWrite(LED_PIN, HIGH); lightState = 1;
+        }
+        if (header.indexOf("GET /light/off") >= 0) {
+          digitalWrite(LED_PIN, LOW); lightState = 0;
+        }
+        if (header.indexOf("GET /aircond/on") >= 0) {
+          digitalWrite(AIRCOND_PIN, HIGH); aircondState = 1;
+        }
+        if (header.indexOf("GET /aircond/off") >= 0) {
+          digitalWrite(AIRCOND_PIN, LOW); aircondState = 0;
+        }
+        if (header.indexOf("GET /door/open") >= 0) {
+          doorServo.write(0); doorState = 1;
+        }
+        if (header.indexOf("GET /door/close") >= 0) {
+          doorServo.write(180); doorState = 0;
+        }
+
+        
+        client.println("HTTP/1.1 200 OK");
+        client.println("Content-type:text/html");
+        client.println("Connection: close\n");
+
+        
+        client.println(R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="5">
+<title>Smart Home</title>
+
+<style>
+body {
+  font-family: 'Segoe UI', Arial, sans-serif;
+  background: #c7d5f0;
+  margin: 0;
+}
+.container {
+  max-width: 420px;
+  margin: auto;
+  padding: 20px;
+}
+h1 { text-align: center; }
+.card {
+  background: #FFB6C1;
+  border-radius: 14px;
+  padding: 15px;
+  margin-bottom: 15px;
+  box-shadow: 0 4px 10px rgba(0,0,0,0.08);
+}
+.status { text-align: center; font-weight: bold; }
+.ok { color: #43a047; }
+.error { color: #e53935; }
+.wait { color: #fb8c00; }
+.buttons {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.btn {
+  padding: 14px;
+  border-radius: 10px;
+  color: white;
+  text-decoration: none;
+  font-weight: bold;
+  text-align: center;
+}
+.on { background: #4CAF50; }
+.off { background: #F44336; }
+</style>
+</head>
+
+<body>
+<div class="container">
+<h1>NexLiving</h1>
+
+<div class="card status">
+)rawliteral");
+
+        // check if sensor is working
+        if (isnan(temp) || isnan(hum)) {
+          client.println("<p class='error'>DHT SENSOR ERROR</p>");
+        } else {
+          client.println("<p class='ok'>Temperature &amp; Humidity OK</p>");
+        }
+
+        client.println("</div><div class='card'>");
+
+        // display sensor data
+        if (!isnan(temp) && !isnan(hum)) {
+          client.print("<p>Temperature: ");
+          client.print(temp);
+          client.println(" &deg;C</p>");
+
+          client.print("<p>Humidity: ");
+          client.print(hum);
+          client.println(" %</p>");
+        }
+
+        client.print("<p>TVOC: ");
+        client.print(tvoc);
+        client.println(" ppb</p>");
+
+        client.print("<p>eCO&#8322;: ");
+        client.print(eco2);
+        client.println(" ppm</p>");
+
+        client.println("</div><div class='card status'>");
+
+        // thingspeak status
+        client.print("ThingSpeak: ");
+        if (thingSpeakOK) {
+          client.println("<span class='ok'>UPDATED</span>");
+        } else {
+          client.println("<span class='wait'>WAITING</span>");
+        }
+
+        client.println("</div><div class='card'>");
+
+        // states
+        client.println("<p>Light: " + String(lightState ? "ON" : "OFF") + "</p>");
+        client.println("<p>Aircond: " + String(aircondState ? "ON" : "OFF") + "</p>");
+        client.println("<p>Door: " + String(doorState ? "OPEN" : "CLOSED") + "</p>");
+
+        client.println("</div><div class='card buttons'>");
+
+        // button
+        client.println("<a class='btn on' href='/light/on'>Light ON</a>");
+        client.println("<a class='btn off' href='/light/off'>Light OFF</a>");
+        client.println("<a class='btn on' href='/aircond/on'>Aircond ON</a>");
+        client.println("<a class='btn off' href='/aircond/off'>Aircond OFF</a>");
+        client.println("<a class='btn on' href='/door/open'>Door OPEN</a>");
+        client.println("<a class='btn off' href='/door/close'>Door CLOSE</a>");
+
+        client.println("</div></div></body></html>");
+        break;
+      }
+    }
+  }
+  client.stop();
+}
+
+// thingspeak
+void thingSpeakUpdate() {
+  if (millis() - lastTS < 20000) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String url = channelURL +
+    "?api_key=" + apiKey +
+    "&field1=" + String(temp) +
+    "&field2=" + String(hum) +
+    "&field3=" + String(tvoc) +
+    "&field4=" + String(eco2) +
+    "&field5=" + String(lightState) +
+    "&field6=" + String(doorState);
+
+  http.begin(url);
+  int httpCode = http.GET();
+  http.end();
+
+  thingSpeakOK = (httpCode == 200);
+  lastTS = millis();
+}
